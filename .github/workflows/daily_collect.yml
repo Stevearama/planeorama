@@ -1,0 +1,36 @@
+name: Daily Flight Data Collection
+
+on:
+  schedule:
+    # Runs at 08:00 UTC daily — after midnight has passed in all US time zones
+    # so yesterday's data is complete on OpenSky.
+    - cron: '0 8 * * *'
+  # Allows manual runs from the GitHub Actions tab (useful for testing
+  # and for triggering extra backfill runs).
+  workflow_dispatch:
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330   # 5.5 hours — well within GitHub's 6-hour job limit
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run flight collector
+        env:
+          OPENSKY_CLIENT_ID:            ${{ secrets.OPENSKY_CLIENT_ID }}
+          OPENSKY_CLIENT_SECRET:        ${{ secrets.OPENSKY_CLIENT_SECRET }}
+          GOOGLE_SERVICE_ACCOUNT_JSON:  ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_DRIVE_FOLDER_ID:       ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+        run: python fetch_flights.py

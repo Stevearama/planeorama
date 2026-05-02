@@ -1,0 +1,18 @@
+# Environment / credentials — never commit these
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+
+# Local data (CSVs live on Google Drive, not in the repo)
+data/
+
+# IDE
+.idea/
+.vscode/
+*.iml

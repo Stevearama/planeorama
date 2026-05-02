@@ -5,9 +5,11 @@ on:
     # Runs at 08:00 UTC daily — after midnight has passed in all US time zones
     # so yesterday's data is complete on OpenSky.
     - cron: '0 8 * * *'
-  # Allows manual runs from the GitHub Actions tab (useful for testing
-  # and for triggering extra backfill runs).
+  # Allows manual runs from the GitHub Actions tab.
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   collect:
@@ -29,8 +31,14 @@ jobs:
 
       - name: Run flight collector
         env:
-          OPENSKY_CLIENT_ID:            ${{ secrets.OPENSKY_CLIENT_ID }}
-          OPENSKY_CLIENT_SECRET:        ${{ secrets.OPENSKY_CLIENT_SECRET }}
-          GOOGLE_SERVICE_ACCOUNT_JSON:  ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          GOOGLE_DRIVE_FOLDER_ID:       ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+          OPENSKY_CLIENT_ID:     ${{ secrets.OPENSKY_CLIENT_ID }}
+          OPENSKY_CLIENT_SECRET: ${{ secrets.OPENSKY_CLIENT_SECRET }}
         run: python fetch_flights.py
+
+      - name: Commit and push data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --staged --quiet || git commit -m "data: $(date -u +%Y-%m-%d) flight update"
+          git push

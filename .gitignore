@@ -9,10 +9,14 @@ dist/
 build/
 .venv/
 
-# Local data (CSVs live on Google Drive, not in the repo)
-data/
+# Google service account key files — never commit these
+*.json
+!package.json
 
 # IDE
 .idea/
 .vscode/
 *.iml
+
+# Claude local settings
+.claude/

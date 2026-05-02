@@ -3,7 +3,8 @@
 Planeorama — Daily flight data collector
 ========================================
 Fetches departure data from the OpenSky Network API and stores per-airport,
-per-year CSVs in Google Drive. Run daily via GitHub Actions.
+per-year Parquet files in the repository data/ directory. Run daily via
+GitHub Actions, which commits and pushes the new files automatically.
 
 Daily flow
 ----------
@@ -16,11 +17,12 @@ Phase 2 — Backfill
     all airports stay at a comparable depth. Airports with the least
     history are processed first within each run.
 
-State persistence
+State persistence (all in data/)
 -----------------
-frontiers.json      — oldest/latest date fetched per airport (on Drive)
-aircraft_cache.json — icao24 → aircraft metadata (on Drive)
-airlines.csv        — OpenFlights airline name table (on Drive)
+frontiers.json      — oldest/latest date fetched per airport
+aircraft_cache.json — icao24 → aircraft metadata
+airlines.csv        — OpenFlights airline name table
+KATL_2024.parquet   — per-airport, per-year flight records
 """
 
 import csv
@@ -32,7 +34,9 @@ import sys
 import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
+import pandas as pd
 import requests
 from dotenv import load_dotenv
 
@@ -57,7 +61,6 @@ AIRPORTS = [
 BACKFILL_TO_DATE = date(2024, 1, 1)
 
 # Stop backfilling when this many flight-endpoint credits remain.
-# 500 covers ~16 forward-fill windows, so tomorrow's Phase 1 will always have room.
 CREDIT_BUFFER = 500
 
 # Window size for each API call. 1–2 days = 30 credits; 3+ days costs 4× more.
@@ -70,12 +73,15 @@ CALL_DELAY = 0.5
 # Pause between aircraft metadata calls on cache misses (seconds).
 AIRCRAFT_CALL_DELAY = 0.2
 
-# Upload the aircraft cache to Drive every N fetch windows.
+# Flush the aircraft cache to disk every N fetch windows.
 CACHE_FLUSH_EVERY = 15
+
+# Directory where all data files are stored (committed to the repo).
+DATA_DIR = Path("data")
 
 # ── API endpoints ──────────────────────────────────────────────────────────────
 
-OPENSKY_BASE     = "https://opensky-network.org/api"
+OPENSKY_BASE      = "https://opensky-network.org/api"
 OPENSKY_TOKEN_URL = (
     "https://auth.opensky-network.org/auth/realms/opensky-network"
     "/protocol/openid-connect/token"
@@ -84,12 +90,11 @@ OPENFLIGHTS_AIRLINES_URL = (
     "https://raw.githubusercontent.com/jpatokal/openflights/master/data/airlines.dat"
 )
 
-# Drive filenames for shared state
-FRONTIERS_FILENAME      = "frontiers.json"
-AIRCRAFT_CACHE_FILENAME = "aircraft_cache.json"
-AIRLINES_FILENAME       = "airlines.csv"
+FRONTIERS_FILE      = DATA_DIR / "frontiers.json"
+AIRCRAFT_CACHE_FILE = DATA_DIR / "aircraft_cache.json"
+AIRLINES_FILE       = DATA_DIR / "airlines.csv"
 
-# ── CSV output columns ─────────────────────────────────────────────────────────
+# ── Parquet output columns ─────────────────────────────────────────────────────
 
 FIELDS = [
     "date",
@@ -115,6 +120,25 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger(__name__)
+
+# ── Local file helpers ─────────────────────────────────────────────────────────
+
+def read_json(path: Path):
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+
+def write_json(path: Path, obj):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+
+
+def read_parquet(path: Path) -> pd.DataFrame:
+    return pd.read_parquet(path) if path.exists() else pd.DataFrame(columns=FIELDS)
+
+
+def write_parquet(path: Path, df: pd.DataFrame):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(path, index=False)
 
 # ── OAuth2 token manager ───────────────────────────────────────────────────────
 
@@ -153,15 +177,17 @@ class TokenManager:
 
 # ── Airline lookup ─────────────────────────────────────────────────────────────
 
-def load_airlines(drive) -> dict:
-    """Returns {ICAO_3_letter: full_airline_name}. Cached on Drive."""
-    raw = drive.download(AIRLINES_FILENAME)
-    if not raw:
+def load_airlines() -> dict:
+    """Returns {ICAO_3_letter: full_airline_name}. Cached in data/."""
+    if AIRLINES_FILE.exists():
+        raw = AIRLINES_FILE.read_bytes()
+    else:
         log.info("Downloading OpenFlights airlines database...")
         r = requests.get(OPENFLIGHTS_AIRLINES_URL, timeout=30)
         r.raise_for_status()
         raw = r.content
-        drive.upload(AIRLINES_FILENAME, raw, mime="text/plain")
+        AIRLINES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        AIRLINES_FILE.write_bytes(raw)
 
     result = {}
     for row in csv.reader(io.StringIO(raw.decode("utf-8", errors="replace"))):
@@ -186,8 +212,8 @@ def carrier_from_callsign(callsign: str, airlines: dict) -> tuple:
 
 # ── Aircraft metadata cache ────────────────────────────────────────────────────
 
-def load_aircraft_cache(drive) -> dict:
-    data = drive.download_json(AIRCRAFT_CACHE_FILENAME)
+def load_aircraft_cache() -> dict:
+    data = read_json(AIRCRAFT_CACHE_FILE)
     cache = data if isinstance(data, dict) else {}
     log.info("Aircraft cache: %d entries", len(cache))
     return cache
@@ -289,21 +315,6 @@ def build_row(flight: dict, aircraft: dict, carrier_icao: str, carrier_name: str
         "typecode":            aircraft.get("typecode", ""),
     }
 
-# ── CSV helpers ────────────────────────────────────────────────────────────────
-
-def rows_to_csv_bytes(rows: list) -> bytes:
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=FIELDS, extrasaction="ignore")
-    writer.writeheader()
-    writer.writerows(rows)
-    return buf.getvalue().encode("utf-8")
-
-
-def csv_bytes_to_rows(data: bytes) -> list:
-    if not data:
-        return []
-    return list(csv.DictReader(io.StringIO(data.decode("utf-8", errors="replace"))))
-
 # ── Frontier helpers ───────────────────────────────────────────────────────────
 
 def get_earliest(frontiers: dict, airport: str) -> date | None:
@@ -341,28 +352,24 @@ def fetch_windows(
     tokens: TokenManager,
     airlines: dict,
     aircraft_cache: dict,
-    drive,
     cache_flush_counter: list,
 ) -> tuple:
     """
     Fetches a list of (w_start, w_end) windows for one airport.
-    Downloads the relevant per-year CSVs from Drive, appends new rows, re-uploads.
+    Reads existing per-year Parquet files, appends new rows, rewrites.
     Returns (new_row_count, credits_remaining).
     """
-    # Group windows by year so we only download/upload each year file once.
     by_year: dict = defaultdict(list)
     for w_start, w_end in windows:
-        # A window can span a year boundary; assign it to the start year.
         by_year[w_start.year].append((w_start, w_end))
 
     total_new = 0
     credits   = None
 
     for year, year_windows in sorted(by_year.items()):
-        filename       = f"{airport}_{year}.csv"
-        existing_bytes = drive.download(filename)
-        existing_rows  = csv_bytes_to_rows(existing_bytes)
-        new_rows       = []
+        filepath    = DATA_DIR / f"{airport}_{year}.parquet"
+        existing_df = read_parquet(filepath)
+        new_rows    = []
 
         for w_start, w_end in year_windows:
             flights, credits = fetch_departures(airport, w_start, w_end, tokens)
@@ -378,12 +385,13 @@ def fetch_windows(
             )
             cache_flush_counter[0] += 1
             if cache_flush_counter[0] >= CACHE_FLUSH_EVERY:
-                drive.upload_json(AIRCRAFT_CACHE_FILENAME, aircraft_cache)
+                write_json(AIRCRAFT_CACHE_FILE, aircraft_cache)
                 cache_flush_counter[0] = 0
 
         if new_rows:
-            all_rows = existing_rows + new_rows
-            drive.upload(filename, rows_to_csv_bytes(all_rows))
+            new_df   = pd.DataFrame(new_rows, columns=FIELDS)
+            combined = pd.concat([existing_df, new_df], ignore_index=True)
+            write_parquet(filepath, combined)
             total_new += len(new_rows)
 
     return total_new, credits
@@ -396,23 +404,20 @@ def main():
     if not client_id or not client_secret:
         raise SystemExit("OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET must be set.")
 
-    from drive_client import DriveClient
-    drive = DriveClient()
-
     log.info("=== Planeorama Flight Collector ===")
     log.info("Airports       : %s", ", ".join(AIRPORTS))
     log.info("Backfill target: %s", BACKFILL_TO_DATE)
     log.info("Credit buffer  : %d", CREDIT_BUFFER)
 
     tokens         = TokenManager(client_id, client_secret)
-    airlines       = load_airlines(drive)
-    aircraft_cache = load_aircraft_cache(drive)
-    frontiers      = drive.download_json(FRONTIERS_FILENAME) or {}
+    airlines       = load_airlines()
+    aircraft_cache = load_aircraft_cache()
+    frontiers      = read_json(FRONTIERS_FILE) or {}
 
-    yesterday             = date.today() - timedelta(days=1)
-    credits               = None
-    cache_flush_counter   = [0]   # mutable so fetch_windows can update it
-    total_rows_written    = 0
+    yesterday           = date.today() - timedelta(days=1)
+    credits             = None
+    cache_flush_counter = [0]
+    total_rows_written  = 0
 
     # ── Phase 1: Forward fill ──────────────────────────────────────────────────
     log.info("--- Phase 1: Forward fill (ensuring data through %s) ---", yesterday)
@@ -424,22 +429,21 @@ def main():
             log.info("%s already current (latest: %s)", airport, latest)
             continue
 
-        start = (latest + timedelta(days=1)) if latest else yesterday
+        start   = (latest + timedelta(days=1)) if latest else yesterday
         windows = list(date_windows(start, yesterday + timedelta(days=1)))
 
         log.info("%s: filling %s → %s (%d windows)", airport, start, yesterday, len(windows))
-        n, credits = fetch_windows(airport, windows, tokens, airlines, aircraft_cache, drive, cache_flush_counter)
+        n, credits = fetch_windows(airport, windows, tokens, airlines, aircraft_cache, cache_flush_counter)
         total_rows_written += n
 
         update_frontier(frontiers, airport,
                         earliest=get_earliest(frontiers, airport) or start,
                         latest=yesterday)
-        drive.upload_json(FRONTIERS_FILENAME, frontiers)
+        write_json(FRONTIERS_FILE, frontiers)
 
     # ── Phase 2: Backfill ──────────────────────────────────────────────────────
     log.info("--- Phase 2: Backfill (target: %s) ---", BACKFILL_TO_DATE)
 
-    # Airports that still need backfilling
     needs_backfill = [
         a for a in AIRPORTS
         if (get_earliest(frontiers, a) or yesterday) > BACKFILL_TO_DATE
@@ -448,17 +452,14 @@ def main():
     if not needs_backfill:
         log.info("All airports fully backfilled to %s.", BACKFILL_TO_DATE)
     else:
-        # Estimate available credits (use header value if we have it, else assume full budget)
-        available = max(0, (credits if credits is not None else 4000) - CREDIT_BUFFER)
-        # Divide equally; each 2-day window costs 30 credits
-        windows_per_airport = max(1, (available // 30) // len(needs_backfill))
+        available            = max(0, (credits if credits is not None else 4000) - CREDIT_BUFFER)
+        windows_per_airport  = max(1, (available // 30) // len(needs_backfill))
 
         log.info(
             "%d airports need backfill — ~%d windows each (%d credits available)",
             len(needs_backfill), windows_per_airport, available,
         )
 
-        # Sort: most recent earliest first (= least history = highest priority)
         needs_backfill.sort(
             key=lambda a: get_earliest(frontiers, a) or yesterday,
             reverse=True,
@@ -473,7 +474,6 @@ def main():
             if current_earliest <= BACKFILL_TO_DATE:
                 continue
 
-            # Build the list of windows going backward from current_earliest
             windows = []
             cursor  = current_earliest
             for _ in range(windows_per_airport):
@@ -491,16 +491,14 @@ def main():
                 "%s: backfilling %s → %s (%d windows)",
                 airport, windows[-1][0], windows[0][1], len(windows),
             )
-            n, credits = fetch_windows(airport, windows, tokens, airlines, aircraft_cache, drive, cache_flush_counter)
+            n, credits = fetch_windows(airport, windows, tokens, airlines, aircraft_cache, cache_flush_counter)
             total_rows_written += n
 
             new_earliest = windows[-1][0]
             update_frontier(frontiers, airport, earliest=new_earliest)
-            drive.upload_json(FRONTIERS_FILENAME, frontiers)
+            write_json(FRONTIERS_FILE, frontiers)
 
-    # Final cache flush
-    drive.upload_json(AIRCRAFT_CACHE_FILENAME, aircraft_cache)
-
+    write_json(AIRCRAFT_CACHE_FILE, aircraft_cache)
     log.info("=== Run complete — %d rows written ===", total_rows_written)
 
 

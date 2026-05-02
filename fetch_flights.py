@@ -1,28 +1,27 @@
 #!/usr/bin/env python3
 """
-Planeorama — Daily flight data collector
-========================================
+Planeorama - Daily flight data collector
+=========================================
 Fetches departure data from the OpenSky Network API and stores per-airport,
-per-year Parquet files in the repository data/ directory. Run daily via
-GitHub Actions, which commits and pushes the new files automatically.
+per-year CSV files in the data/ directory. Run manually or via Task Scheduler.
 
 Daily flow
 ----------
-Phase 1 — Forward fill
+Phase 1 - Forward fill
     Ensure every airport has data up to yesterday. Runs first, always.
 
-Phase 2 — Backfill
+Phase 2 - Backfill
     Use remaining credits to push history back toward BACKFILL_TO_DATE.
     Credits are divided equally across airports that still need work, so
     all airports stay at a comparable depth. Airports with the least
     history are processed first within each run.
 
-State persistence (all in data/)
------------------
-frontiers.json      — oldest/latest date fetched per airport
-aircraft_cache.json — icao24 → aircraft metadata
-airlines.csv        — OpenFlights airline name table
-KATL_2024.parquet   — per-airport, per-year flight records
+State (all in data/)
+--------------------
+frontiers.json      - oldest/latest date fetched per airport
+aircraft_cache.json - icao24 -> aircraft metadata cache
+airlines.csv        - OpenFlights airline name table
+KDEN_2026.csv       - per-airport, per-year flight records
 """
 
 import csv
@@ -36,7 +35,6 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-import pandas as pd
 import requests
 from dotenv import load_dotenv
 
@@ -44,26 +42,30 @@ load_dotenv()
 
 # ── User-editable config ───────────────────────────────────────────────────────
 
+# AIRPORTS = [
+#     "KATL",   # Atlanta Hartsfield-Jackson
+#     "KLAX",   # Los Angeles International
+#     "KORD",   # Chicago O'Hare
+#     "KDFW",   # Dallas / Fort Worth
+#     "KDEN",   # Denver International
+#     "KJFK",   # New York JFK
+#     "KSFO",   # San Francisco International
+#     "KLAS",   # Las Vegas Harry Reid
+#     "KSEA",   # Seattle-Tacoma
+#     "KMIA",   # Miami International
+# ]
+
 AIRPORTS = [
-    "KATL",   # Atlanta Hartsfield-Jackson
-    "KLAX",   # Los Angeles International
-    "KORD",   # Chicago O'Hare
-    "KDFW",   # Dallas / Fort Worth
     "KDEN",   # Denver International
-    "KJFK",   # New York JFK
-    "KSFO",   # San Francisco International
-    "KLAS",   # Las Vegas Harry Reid
-    "KSEA",   # Seattle-Tacoma
-    "KMIA",   # Miami International
 ]
 
 # Oldest date to backfill to. Lower this variable over time to extend history.
-BACKFILL_TO_DATE = date(2024, 1, 1)
+BACKFILL_TO_DATE = date(2026, 3, 1)
 
 # Stop backfilling when this many flight-endpoint credits remain.
 CREDIT_BUFFER = 500
 
-# Window size for each API call. 1–2 days = 30 credits; 3+ days costs 4× more.
+# Window size for each API call. 1-2 days = 30 credits; 3+ days costs 4x more.
 # Do not change this above 2.
 QUERY_DAYS = 2
 
@@ -76,7 +78,7 @@ AIRCRAFT_CALL_DELAY = 0.2
 # Flush the aircraft cache to disk every N fetch windows.
 CACHE_FLUSH_EVERY = 15
 
-# Directory where all data files are stored (committed to the repo).
+# Directory where all data files are stored.
 DATA_DIR = Path("data")
 
 # ── API endpoints ──────────────────────────────────────────────────────────────
@@ -94,7 +96,7 @@ FRONTIERS_FILE      = DATA_DIR / "frontiers.json"
 AIRCRAFT_CACHE_FILE = DATA_DIR / "aircraft_cache.json"
 AIRLINES_FILE       = DATA_DIR / "airlines.csv"
 
-# ── Parquet output columns ─────────────────────────────────────────────────────
+# ── CSV output columns ─────────────────────────────────────────────────────────
 
 FIELDS = [
     "date",
@@ -117,7 +119,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    stream=sys.stdout,
+    handlers=[logging.StreamHandler(
+        open(sys.stdout.fileno(), mode="w", encoding="utf-8", closefd=False)
+    )],
 )
 log = logging.getLogger(__name__)
 
@@ -132,13 +136,19 @@ def write_json(path: Path, obj):
     path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
 
 
-def read_parquet(path: Path) -> pd.DataFrame:
-    return pd.read_parquet(path) if path.exists() else pd.DataFrame(columns=FIELDS)
+def read_csv(path: Path) -> list:
+    if not path.exists():
+        return []
+    with path.open(encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
 
 
-def write_parquet(path: Path, df: pd.DataFrame):
+def write_csv(path: Path, rows: list):
     path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(path, index=False)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
 
 # ── OAuth2 token manager ───────────────────────────────────────────────────────
 
@@ -236,7 +246,7 @@ def lookup_aircraft(icao24: str, cache: dict, tokens: TokenManager) -> dict:
             cache[key] = r.json()
         elif r.status_code == 429:
             wait = int(r.headers.get("X-Rate-Limit-Retry-After-Seconds", 60))
-            log.warning("Aircraft lookup rate-limited — waiting %ds", wait)
+            log.warning("Aircraft lookup rate-limited - waiting %ds", wait)
             time.sleep(wait)
             return lookup_aircraft(icao24, cache, tokens)
         else:
@@ -249,12 +259,7 @@ def lookup_aircraft(icao24: str, cache: dict, tokens: TokenManager) -> dict:
 
 # ── OpenSky departures ─────────────────────────────────────────────────────────
 
-def fetch_departures(
-    airport: str,
-    w_start: date,
-    w_end: date,
-    tokens: TokenManager,
-) -> tuple:
+def fetch_departures(airport: str, w_start: date, w_end: date, tokens: TokenManager) -> tuple:
     """
     Returns (flights, credits_remaining).
     Queries [w_start 00:00 UTC, w_end 00:00 UTC).
@@ -281,18 +286,18 @@ def fetch_departures(
                 return ([], credits)
             elif r.status_code == 429:
                 wait = int(r.headers.get("X-Rate-Limit-Retry-After-Seconds", 60))
-                log.warning("Rate limited — waiting %ds (attempt %d)", wait, attempt + 1)
+                log.warning("Rate limited - waiting %ds (attempt %d)", wait, attempt + 1)
                 time.sleep(wait)
             elif r.status_code == 401:
                 log.info("Token expired mid-fetch, retrying...")
             else:
-                log.warning("HTTP %d for %s %s→%s", r.status_code, airport, w_start, w_end)
+                log.warning("HTTP %d for %s %s -> %s", r.status_code, airport, w_start, w_end)
                 return ([], None)
         except requests.RequestException as exc:
             log.warning("Request error attempt %d: %s", attempt + 1, exc)
             time.sleep(5 * (attempt + 1))
 
-    log.error("All retries failed for %s %s→%s", airport, w_start, w_end)
+    log.error("All retries failed for %s %s -> %s", airport, w_start, w_end)
     return ([], None)
 
 # ── Row builder ────────────────────────────────────────────────────────────────
@@ -356,7 +361,7 @@ def fetch_windows(
 ) -> tuple:
     """
     Fetches a list of (w_start, w_end) windows for one airport.
-    Reads existing per-year Parquet files, appends new rows, rewrites.
+    Reads existing per-year CSVs, appends new rows, rewrites.
     Returns (new_row_count, credits_remaining).
     """
     by_year: dict = defaultdict(list)
@@ -367,9 +372,9 @@ def fetch_windows(
     credits   = None
 
     for year, year_windows in sorted(by_year.items()):
-        filepath    = DATA_DIR / f"{airport}_{year}.parquet"
-        existing_df = read_parquet(filepath)
-        new_rows    = []
+        filepath      = DATA_DIR / f"{airport}_{year}.csv"
+        existing_rows = read_csv(filepath)
+        new_rows      = []
 
         for w_start, w_end in year_windows:
             flights, credits = fetch_departures(airport, w_start, w_end, tokens)
@@ -380,7 +385,7 @@ def fetch_windows(
                 new_rows.append(build_row(fl, aircraft, ci, cn))
 
             log.info(
-                "  %s %s→%s: %d flights  (credits remaining: %s)",
+                "  %s %s -> %s: %d flights  (credits remaining: %s)",
                 airport, w_start, w_end, len(flights), credits,
             )
             cache_flush_counter[0] += 1
@@ -389,9 +394,7 @@ def fetch_windows(
                 cache_flush_counter[0] = 0
 
         if new_rows:
-            new_df   = pd.DataFrame(new_rows, columns=FIELDS)
-            combined = pd.concat([existing_df, new_df], ignore_index=True)
-            write_parquet(filepath, combined)
+            write_csv(filepath, existing_rows + new_rows)
             total_new += len(new_rows)
 
     return total_new, credits
@@ -432,7 +435,7 @@ def main():
         start   = (latest + timedelta(days=1)) if latest else yesterday
         windows = list(date_windows(start, yesterday + timedelta(days=1)))
 
-        log.info("%s: filling %s → %s (%d windows)", airport, start, yesterday, len(windows))
+        log.info("%s: filling %s -> %s (%d windows)", airport, start, yesterday, len(windows))
         n, credits = fetch_windows(airport, windows, tokens, airlines, aircraft_cache, cache_flush_counter)
         total_rows_written += n
 
@@ -452,11 +455,11 @@ def main():
     if not needs_backfill:
         log.info("All airports fully backfilled to %s.", BACKFILL_TO_DATE)
     else:
-        available            = max(0, (credits if credits is not None else 4000) - CREDIT_BUFFER)
-        windows_per_airport  = max(1, (available // 30) // len(needs_backfill))
+        available           = max(0, (credits if credits is not None else 4000) - CREDIT_BUFFER)
+        windows_per_airport = max(1, (available // 30) // len(needs_backfill))
 
         log.info(
-            "%d airports need backfill — ~%d windows each (%d credits available)",
+            "%d airports need backfill - ~%d windows each (%d credits available)",
             len(needs_backfill), windows_per_airport, available,
         )
 
@@ -488,7 +491,7 @@ def main():
                 continue
 
             log.info(
-                "%s: backfilling %s → %s (%d windows)",
+                "%s: backfilling %s -> %s (%d windows)",
                 airport, windows[-1][0], windows[0][1], len(windows),
             )
             n, credits = fetch_windows(airport, windows, tokens, airlines, aircraft_cache, cache_flush_counter)
@@ -499,7 +502,7 @@ def main():
             write_json(FRONTIERS_FILE, frontiers)
 
     write_json(AIRCRAFT_CACHE_FILE, aircraft_cache)
-    log.info("=== Run complete — %d rows written ===", total_rows_written)
+    log.info("=== Run complete - %d rows written ===", total_rows_written)
 
 
 if __name__ == "__main__":

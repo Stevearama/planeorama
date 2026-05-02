@@ -1,11 +1,8 @@
 name: Daily Flight Data Collection
 
 on:
-  schedule:
-    # Runs at 08:00 UTC daily — after midnight has passed in all US time zones
-    # so yesterday's data is complete on OpenSky.
-    - cron: '0 8 * * *'
-  # Allows manual runs from the GitHub Actions tab.
+  # Manual runs from the GitHub Actions tab (for testing/recovery).
+  # The daily schedule runs locally via Windows Task Scheduler (run.ps1).
   workflow_dispatch:
 
 permissions:
